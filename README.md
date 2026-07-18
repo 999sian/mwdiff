@@ -17,8 +17,9 @@ oracle.
 - [DTK](https://github.com/encounter/decomp-toolkit), found through `$DTK` or
   `./build/tools/dtk`
 - Ninja for source-variant builds
+- `objdiff.json` for project-aware unit resolution
 - `objdiff-cli`, found through `$OBJDIFF` or `./build/tools/objdiff-cli`, for
-  project-aware diagnosis and search
+  search scoring
 - Optional: `z3-solver` for `prove` and `search --prove`
 
 Run the script from the root of the decomp project being analyzed:
