@@ -1,68 +1,107 @@
 # mwdiff
 
-Per-function asm diff helper for [decomp-toolkit](https://github.com/encounter/decomp-toolkit) (dtk) based matching decomps — GameCube/Wii projects built with MWCC (Wind Waker, Twilight Princess, Pikmin, Metroid Prime, and other dtk-template projects).
+Per-function assembly diffing, compiler-guided source search, and optional
+PowerPC equivalence checking for
+[decomp-toolkit](https://github.com/encounter/decomp-toolkit) projects built
+with MWCC.
 
-It compares two object files by disassembling each with `dtk elf disasm` and diffing function-by-function, normalising away cosmetic noise (address columns, local label names, `@NNNN`/`$NNNN` compiler counters, anonymous section symbols) so only *real* instruction differences show.
-
-The distinctive piece is `try`: a brute-forcer that substitutes each candidate C snippet into a source file, rebuilds one object with ninja, and reports the diff count of a single function — the loop that makes "guess the C that MWCC wants" fast.
+`mwdiff` is a scriptable companion to
+[objdiff](https://github.com/encounter/objdiff). It normalizes cosmetic DTK
+disassembly differences, helps test the C spellings MWCC may want, and can
+reject supported behavior-changing candidates with an optional Z3-backed
+oracle.
 
 ## Requirements
 
-- Python 3.8+ (stdlib only)
-- `dtk` — found via `$DTK`, or `./build/tools/dtk` (the dtk-template default)
-- `ninja` (for the `try` subcommand)
+- Python 3.10+
+- [DTK](https://github.com/encounter/decomp-toolkit), found through `$DTK` or
+  `./build/tools/dtk`
+- Ninja for source-variant builds
+- `objdiff-cli`, found through `$OBJDIFF` or `./build/tools/objdiff-cli`, for
+  project-aware diagnosis and search
+- Optional: `z3-solver` for `prove` and `search --prove`
 
-Run it from your decomp repo root.
-
-## Usage
-
-### `diff` — summarise a whole translation unit
-
-```sh
-mwdiff.py diff build/GZLE01/obj/d/d_example.o build/obj/d/d_example.o
-```
-
-Prints a per-function diff-line count, sorted smallest-first (the almost-matched functions worth attacking next are at the top). Functions missing from your object are flagged `MISSING in mine`, and functions only in yours are listed as deadstrip candidates. Prints `all N functions EXACT` when done.
-
-### `show` — full diff of one function
+Run the script from the root of the decomp project being analyzed:
 
 ```sh
-mwdiff.py show <target.o> <mine.o> '<mangled_fn>'
+python3 /path/to/mwdiff/mwdiff.py --help
 ```
 
-Unified diff of the normalised disassembly. Unknown function names get fuzzy-match suggestions — handy with long MWCC manglings.
+## Commands
 
-### `try` — brute-force source variants
+| Command | Purpose |
+|---|---|
+| `diff` | Summarize normalized per-function object differences. |
+| `show` | Print one normalized function diff. |
+| `try` | Compile explicit source variants. |
+| `diagnose` | Classify a configured unit's mismatch and suggest mutation families. |
+| `search` | Generate, compile, score, and optionally apply bounded MWCC source mutations. |
+| `prove` | Prove supported acyclic integer PowerPC functions equivalent, or return a counterexample or `unknown`. |
+
+### Compare objects
 
 ```sh
-mwdiff.py try src/d/d_example.cpp build/obj/d/d_example.o \
-    build/GZLE01/obj/d/d_example.o '<mangled_fn>' variants.py
+python3 /path/to/mwdiff/mwdiff.py diff <target.o> <mine.o>
+python3 /path/to/mwdiff/mwdiff.py show <target.o> <mine.o> '<mangled_fn>'
 ```
 
-`variants.py` defines two names:
+### Diagnose and search a configured unit
 
-```py
-BASE = """
-    if (a < b)
-        a = b;
-"""
+`diagnose` and `search` resolve units from the decomp project's `objdiff.json`:
 
-VARIANTS = {
-    "ternary":  "    a = a < b ? b : a;\n",
-    "max-call": "    a = MAX(a, b);\n",
-    "orig":     BASE,
-}
+```sh
+python3 /path/to/mwdiff/mwdiff.py diagnose \
+  --unit d_a_example --fn '<mangled_fn>'
+
+python3 /path/to/mwdiff/mwdiff.py search \
+  --unit d_a_example --fn '<mangled_fn>' \
+  --line 120:124 --families bool,compare,local-form --depth 2
 ```
 
-For each variant, `BASE` is replaced in the source file, the object is rebuilt with ninja, and the function's diff count is printed. Stops at the first `EXACT` (pass `--no-stop` to test everything). The original source is always restored — and rebuilt — afterwards, even on Ctrl-C.
+Search changes only the selected source range, rebuilds the configured object,
+and ranks candidates with objdiff plus normalized DTK output. Add `--apply` to
+retain a whole-object exact candidate. Add `--apply --verify` to check locally
+available versions, including linked REL SHA values when configured.
+
+### Prove supported functions
+
+Z3 remains optional:
+
+```sh
+uv run --with z3-solver python3 /path/to/mwdiff/mwdiff.py prove \
+  <target.o> <mine.o> '<mangled_fn>' --json
+```
+
+The result is `equivalent`, `different` with a counterexample, or conservative
+`unknown`. `search --prove` rejects only candidates proven different; unknown
+candidates remain eligible and are labeled.
+
+## Safety
+
+Source mutations are transactional. Original source bytes and metadata are
+restored after failures and interrupts, and the original object is forcibly
+rebuilt so Ninja cannot preserve a stale candidate. An applied search result is
+called exact only when configured whole-object function, code, and data
+measures are all 100%.
+
+The linked binary or REL checksum remains the authoritative matching gate.
+
+## Full guide
+
+See [mwdiff.md](mwdiff.md) for every command, mutation family, cache key,
+verification rule, proof observable, unsupported case, and troubleshooting
+note.
+
+## Tests
+
+```sh
+python3 -m unittest discover -p 'test_*.py'
+uv run --with z3-solver python3 -m unittest discover -p 'test_*.py'
+```
 
 ## Exit codes
 
-`0` = all exact · `1` = differences found · `2` = usage or tool error — safe to use in scripts and CI.
-
-## Other tools
-
-For interactive per-function diffing with a UI, see [objdiff](https://github.com/encounter/objdiff). mwdiff is the scriptable/batch complement: one-shot TU summaries and automated variant testing.
+`0` = exact/equivalent · `1` = different or unknown · `2` = usage/tool error
 
 ## License
 
