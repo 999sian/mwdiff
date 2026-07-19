@@ -41,7 +41,7 @@ python3 /path/to/mwdiff/mwdiff.py --help
 | `diff` | Summarize normalized per-function object differences. |
 | `show` | Print one normalized function diff. |
 | `try` | Compile explicit source variants. |
-| `diagnose` | Classify a configured unit's mismatch and suggest mutation families. |
+| `diagnose` | Classify a mismatch, name MWCC idiom fingerprints, and suggest mutation families. |
 | `search` | Generate, compile, score, and optionally apply bounded MWCC source mutations. |
 | `prove` | Prove supported acyclic integer PowerPC functions equivalent, or return a counterexample or `unknown`. |
 | `reconstruct` | Bounded Ghidra/LLM/compiler feedback loop for one configured unit. |

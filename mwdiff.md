@@ -209,6 +209,13 @@ without spaces.
 | `return` | Try direct `TRUE` and `FALSE` returns. |
 | `evaluation-order` | Use the bounded reassociation transformations. |
 | `version` | Vary the operator of an existing `VERSION_*` preprocessor guard. |
+| `width` | Swap same-width integer sign/spelling ({s8,u8,char}, {s16,u16}, {s32,u32}); never `int`<->`s32`. |
+| `fp-helper` | Wrap a float expression in `(f32)`/`(f64)` to steer f32-vs-double codegen. |
+| `bitfield` | Rewrite a shift+mask bit extraction into an equivalent form. |
+| `decl-order` | Permute adjacent local declarations to recolor saved registers. |
+| `param-inversion` | Hoist a call argument into a temp to change evaluation order. |
+| `pragma` | Wrap the snippet in `#pragma peephole`/`scheduling`/`fp_contract` toggles. |
+| `int64` | Move a downcast earlier in a 64-bit expression. |
 
 Unsupported source shapes simply generate no candidate. Search is deliberately
 bounded; it is not a general C++ synthesizer.
