@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 from ppc_equiv import (
     _mask,
@@ -9,6 +10,7 @@ from ppc_equiv import (
     initial_state,
     parse_program,
     prove,
+    require_z3,
     step_call,
     step_compare,
     step_integer,
@@ -19,6 +21,18 @@ try:
     import z3
 except ImportError:
     z3 = None
+
+
+class TestDependency(unittest.TestCase):
+    def test_missing_z3_guidance_is_location_independent(self):
+        with mock.patch("ppc_equiv._z3", None), \
+                mock.patch.dict("sys.modules", {"z3": None}):
+            with self.assertRaises(RuntimeError) as raised:
+                require_z3()
+
+        message = str(raised.exception)
+        self.assertIn("prefix your existing command", message)
+        self.assertNotIn("tools/mwdiff.py", message)
 
 
 @unittest.skipUnless(z3, "z3-solver is optional")

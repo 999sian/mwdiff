@@ -367,15 +367,23 @@ def generate_candidates(snippet, families, depth=1):
     results = []
     for level in range(1, depth + 1):
         next_frontier = []
+        level_seen = set()
         for parent in frontier:
+            parent_seen = set()
             for family in families:
                 for name, text in MUTATION_FAMILIES[family](parent.text).items():
-                    if text in seen:
+                    if text in seen or text in parent_seen:
                         continue
-                    seen.add(text)
-                    candidate = SourceCandidate(f"{parent.name}+{name}", text, level)
+                    parent_seen.add(text)
+                    if level == 1 and text in level_seen:
+                        continue
+                    level_seen.add(text)
+                    candidate = SourceCandidate(
+                        f"{parent.name}+{name}", text, level
+                    )
                     results.append(candidate)
                     next_frontier.append(candidate)
+        seen.update(level_seen)
         frontier = next_frontier
     return results
 
@@ -469,7 +477,7 @@ class ProjectUnit:
     mine: Path
     ninja_target: str
     version: str
-    module: str
+    module: str | None
     compiler: str
     compiler_flags: str
     context_path: Path | None
@@ -501,7 +509,11 @@ def resolve_unit(project, unit_name, version=None):
                          f"run python configure.py --version {version}")
     relative_parts = target.parts
     build_index = relative_parts.index("build")
-    module = relative_parts[build_index + 2]
+    module = (
+        relative_parts[build_index + 2]
+        if relative_parts[build_index + 3] == "obj"
+        else None
+    )
     scratch = raw.get("scratch", {})
     context = scratch.get("ctx_path")
     return ProjectUnit(
@@ -538,6 +550,12 @@ def expected_sha(sha_file, relative_path):
     raise ValueError(f"no SHA entry for {relative_path}")
 
 
+def _rel_path(unit, version):
+    if unit.module is None:
+        raise ValueError("--verify supports configured REL units only")
+    return Path("build") / version / unit.module / f"{unit.module}.rel"
+
+
 @dataclass(frozen=True)
 class VerificationResult:
     version: str
@@ -566,7 +584,7 @@ def verify_version(project, unit_name, version):
     if refreshed.returncode:
         raise RuntimeError(refreshed.stderr.strip() or refreshed.stdout.strip())
     unit = resolve_unit(project, unit_name, version)
-    rel = Path("build") / version / unit.module / f"{unit.module}.rel"
+    rel = _rel_path(unit, version)
     process = subprocess.run(
         ["ninja", f"build/{version}/report.json", rel.as_posix()],
         cwd=project,
@@ -929,6 +947,10 @@ def search_candidates(unit, function, candidates, max_builds,
                     candidate for candidate in depth_candidates
                     if any(candidate.name.startswith(parent + "+")
                            for parent in parent_names)]
+                unique_candidates = {}
+                for candidate in depth_candidates:
+                    unique_candidates.setdefault(candidate.text, candidate)
+                depth_candidates = list(unique_candidates.values())
             level_results = []
             for candidate in depth_candidates:
                 if builds >= max_builds:
@@ -1210,6 +1232,8 @@ def cmd_search(args):
             raise ValueError("--verify requires --apply")
         prove_candidate = getattr(args, "prove", False)
         unit = resolve_unit(args.project, args.unit, args.version)
+        if args.verify:
+            _rel_path(unit, unit.version)
         original = unit.source.read_text()
         lines = original.splitlines(keepends=True)
         snippet, start, end = source_range(original, args.line)

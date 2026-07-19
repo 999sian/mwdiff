@@ -18,8 +18,8 @@ def require_z3():
             import z3
         except ImportError as error:
             raise RuntimeError(
-                "mwdiff prove requires z3-solver; run with "
-                "`uv run --with z3-solver python3 tools/mwdiff.py prove ...`"
+                "mwdiff proof requires z3-solver; prefix your existing command "
+                "with `uv run --with z3-solver`"
             ) from error
         _z3 = z3
     return _z3

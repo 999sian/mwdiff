@@ -63,6 +63,8 @@ Search changes only the selected source range, rebuilds the configured object,
 and ranks candidates with objdiff plus normalized DTK output. Add `--apply` to
 retain a whole-object exact candidate. Add `--apply --verify` to check locally
 available versions, including linked REL SHA values when configured.
+Verification currently supports configured REL units only; executable/DOL
+units are rejected before source mutation.
 
 ### Prove supported functions
 

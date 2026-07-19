@@ -591,6 +591,20 @@ class TestProjectResolution(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "configured for GZLP01"):
                 resolve_unit(root, "d_a_obj_demo", "D44J01")
 
+    def test_executable_unit_has_no_rel_module(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "objdiff.json").write_text(json.dumps({"units": [{
+                "name": "d/main/d_a_demo",
+                "target_path": "build/GZLP01/obj/d/main/d_a_demo.o",
+                "base_path": "build/GZLP01/src/d/main/d_a_demo.o",
+                "metadata": {"source_path": "src/d/main/d_a_demo.cpp"},
+            }]}))
+
+            unit = resolve_unit(root, "d_a_demo", "GZLP01")
+
+            self.assertIsNone(unit.module)
+
     def test_reports_ambiguous_suffix(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -675,6 +689,46 @@ class TestSearch(unittest.TestCase):
             self.assertIn("*(volatile u8*)&current.roomNo", result.candidate.text)
             self.assertIn("(char)room_no", result.candidate.text)
 
+    def test_depth_two_preserves_selected_parent_provenance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "demo.cpp"
+            source.write_text(
+                "s8 room_no = current.roomNo;\ncall((s8)room_no);\n")
+            unit = mock.Mock(
+                project=root,
+                source=source,
+                ninja_target="build/demo.o",
+                target=root / "target.o",
+                mine=root / "mine.o",
+            )
+            candidates = generate_candidates(
+                source.read_text(), ["load", "cast"], depth=2)
+
+            def fake_score(*args):
+                text = source.read_text()
+                if "volatile u8" in text and "(char)room_no" in text:
+                    return ObjectScore(True, 100.0, "exact", 0, 0, 0)
+                if "(char)room_no" in text:
+                    return ObjectScore(
+                        False, 99.0, "local-register-allocation", 1, 0, 0
+                    )
+                return ObjectScore(
+                    False, 90.0, "semantic-instruction", 10, 0, 0
+                )
+
+            with mock.patch(
+                    "mwdiff.subprocess.run",
+                    return_value=mock.Mock(returncode=0, stdout="", stderr=""),
+            ), mock.patch("mwdiff.score_object", side_effect=fake_score):
+                result = search_candidates(
+                    unit, "fake", candidates, 20, True, False, 1
+                )
+
+            self.assertTrue(result.exact)
+            self.assertIn("*(volatile u8*)&current.roomNo", result.candidate.text)
+            self.assertIn("(char)room_no", result.candidate.text)
+
     def test_keyboard_interrupt_restores_source(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -739,7 +793,9 @@ class TestSearchCli(unittest.TestCase):
             root = Path(directory)
             source = root / "demo.cpp"
             source.write_text("if (check() != FALSE) {\n")
-            unit = mock.Mock(source=source)
+            unit = mock.Mock(
+                source=source, module="demo", version="GZLP01"
+            )
             candidate = SourceCandidate("exact", "if (check()) {\n", 1)
             result = SearchResult(
                 candidate,
@@ -806,6 +862,49 @@ class TestSearchCli(unittest.TestCase):
             cmd_search(args)
         self.assertEqual(raised.exception.code, 2)
         self.assertIn("--verify requires --apply", stderr.getvalue())
+
+    def test_verify_rejects_executable_unit_before_search(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "demo.cpp"
+            source.write_text("if (check() != FALSE) {\n")
+            unit = mock.Mock(source=source, module=None)
+            args = Namespace(
+                project=root,
+                version="GZLP01",
+                unit="demo",
+                fn="fn",
+                line="1",
+                families="bool",
+                depth=1,
+                max_builds=10,
+                beam_width=5,
+                no_stop=False,
+                apply=True,
+                verify=True,
+                verify_version=[],
+                json=False,
+            )
+            result = SearchResult(None, None, 0, 0)
+            stderr = StringIO()
+
+            with mock.patch("mwdiff.resolve_unit", return_value=unit), \
+                    mock.patch(
+                        "mwdiff.search_candidates", return_value=result
+                    ) as search, \
+                    mock.patch("mwdiff.available_versions", return_value=[]), \
+                    mock.patch("mwdiff.configured_versions", return_value=[]), \
+                    redirect_stderr(stderr), \
+                    self.assertRaises(SystemExit) as raised:
+                cmd_search(args)
+
+            self.assertEqual(raised.exception.code, 2)
+            self.assertIn(
+                "--verify supports configured REL units only",
+                stderr.getvalue(),
+            )
+            self.assertEqual(source.read_text(), "if (check() != FALSE) {\n")
+            search.assert_not_called()
 
 
 

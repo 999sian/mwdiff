@@ -31,7 +31,7 @@ This update will not add packaging, a dependency manager, CI configuration, gene
 
 All source mutations run inside a restoration transaction. Source bytes, metadata, and signal handlers are restored after success, failure, or interruption unless an exact candidate is explicitly applied. The generated object is invalidated and rebuilt after restoration so Ninja timestamps cannot leave a stale candidate object.
 
-An applied candidate is considered exact only when configured whole-object function, code, and data measures are all 100%. Cross-version verification additionally checks the linked REL SHA and restores the original project configuration. Build, restoration, and verification failures are surfaced with nonzero exits.
+An applied candidate is considered exact only when configured whole-object function, code, and data measures are all 100%. Cross-version verification additionally checks the linked REL SHA and restores the original project configuration. Executable/DOL units are rejected before source mutation because linked-output verification currently supports configured REL units only. Build, restoration, and verification failures are surfaced with nonzero exits.
 
 Unsupported instructions, loops, symbolic relocations, unresolved calls, incompatible call traces, and differences dependent on unconstrained external-call models produce `unknown`, never a false equivalence claim. Existing non-proof commands must import and run without Z3 installed.
 
@@ -53,7 +53,7 @@ Before publication:
 
 ## Acceptance Criteria
 
-- The standalone repository contains the same verified implementation and behavioral tests as TWW commit `85c5b82e`.
+- The standalone repository starts from the verified implementation and behavioral tests at TWW commit `85c5b82e`, plus standalone release regressions found during review.
 - Existing commands remain usable without new mandatory dependencies.
 - The optional proof command has actionable missing-Z3 guidance and conservative `unknown` behavior.
 - README and detailed guide describe the actual CLI and safety boundaries.

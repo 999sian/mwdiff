@@ -48,6 +48,8 @@ Keep these separate:
 exactness. `search --apply --verify` also checks linked REL SHA values for the
 requested locally available versions. The linked checksum remains the final
 gate.
+Verification currently supports configured REL units only. Executable/DOL
+units are rejected before search mutates source.
 
 ## Commands
 
@@ -222,7 +224,7 @@ bounded; it is not a general C++ synthesizer.
 | `--beam-width <n>` | Number of best parents kept for depth two; default 5. |
 | `--no-stop` | Continue after an exact candidate. |
 | `--apply` | Retain the best candidate only when the object is exact. |
-| `--verify` | After applying exact source, verify requested versions and REL SHA. Requires `--apply`. |
+| `--verify` | After applying exact source, verify requested versions and REL SHA for configured REL units. Requires `--apply`. |
 | `--verify-version <id>` | Version to verify; repeat for multiple versions. |
 | `--json` | Emit one JSON result document. |
 | `--prove` | Reject supported candidates proven behavior-changing. |
@@ -270,6 +272,10 @@ restored.
 `build.ninja`, builds each report and linked REL, checks function/code/data
 percentages and expected REL SHA, then restores and regenerates the original
 configuration in a `finally` path.
+
+Verification currently supports configured REL units. Executable/DOL units are
+rejected before candidate search, so `--verify` cannot retain source and then
+fail solely because no REL output exists.
 
 Without `--verify-version`, verification uses locally available versions.
 Configured versions without real local disc input are listed as unavailable;

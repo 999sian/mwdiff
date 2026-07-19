@@ -73,7 +73,7 @@ Run:
 uv run --with z3-solver python3 -m unittest discover -p 'test_*.py' -v
 ```
 
-Expected: `Ran 73 tests` and `OK`.
+Expected: `Ran 77 tests` and `OK`.
 
 - [ ] **Step 5: Verify the mandatory-dependency boundary**
 
@@ -199,7 +199,7 @@ bool, compare, cast, load, reassociate, switch, wrapper,
 local-form, return, evaluation-order, version
 ```
 
-State that `--apply` retains only a whole-object exact candidate and `--verify` checks functions/code/data plus linked REL SHA across requested locally available versions.
+State that `--apply` retains only a whole-object exact candidate and `--verify` checks functions/code/data plus linked REL SHA across requested locally available versions for configured REL units. Executable/DOL units must be rejected before source mutation.
 
 - [ ] **Step 4: Add proof semantics and limits**
 
@@ -246,7 +246,7 @@ git commit -m "docs: document search, verification, and proof"
 uv run --with z3-solver python3 -m unittest discover -p 'test_*.py' -v
 ```
 
-Expected: `Ran 73 tests` and `OK`.
+Expected: `Ran 77 tests` and `OK`.
 
 - [ ] **Step 2: Run Z3-free and CLI smoke gates**
 
