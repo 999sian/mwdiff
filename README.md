@@ -45,6 +45,7 @@ python3 /path/to/mwdiff/mwdiff.py --help
 | `search` | Generate, compile, score, and optionally apply bounded MWCC source mutations. |
 | `prove` | Prove supported acyclic integer PowerPC functions equivalent, or return a counterexample or `unknown`. |
 | `reconstruct` | Bounded Ghidra/LLM/compiler feedback loop for one configured unit. |
+| `bench` | Score idiom fingerprint/family detection offline (no build). |
 
 ### Compare objects
 

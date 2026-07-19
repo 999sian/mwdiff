@@ -576,6 +576,38 @@ own credentials, which `mwdiff` never reads, serializes, logs, or caches.
 Model-proposed names and types remain hypotheses: exact machine output proves
 code and data, not the human meaning of an inferred name.
 
+### `bench` — score idiom detection offline
+
+```sh
+python3 "$MWDIFF" bench [--cases PATH] [--json]
+```
+
+Runs `diagnose` over transcribed `(target asm, mine asm, expected fingerprint,
+expected family)` cases (default `mwdiff_bench/cases.json`) and reports how often
+the expected fingerprint is detected and the expected family suggested. Fully
+offline: no build, network, or subprocess. Exit `0` iff every case's fingerprint
+is detected.
+
+## Idiom fingerprints and families
+
+`diagnose` inspects the diffed instruction stream for named MWCC/PowerPC codegen
+tells and prints them under a `fingerprints:` block (also in `--json`), each with
+a cause and the mutation families that address it. Detected fingerprints include
+`spurious-extsb` (u8 vs char/s8, or u16 vs s16), `spurious-frsp` (f32 vs double),
+`float-to-int-dance`, `bitfield-write`, `fp-contract`, `int64-carry`, and
+`saved-register-order`.
+
+`search` gains seven idiom families beyond the originals: `width` (same-width
+sign/spelling swaps), `fp-helper` (f32/f64 evaluation), `bitfield`, `decl-order`
+(reorder local declarations to recolor saved registers), `param-inversion`,
+`pragma` (`peephole`/`scheduling`/`fp_contract` toggles), and `int64`. `pragma`
+and `param-inversion` are visible-in-source levers and are suggested last.
+
+`reconstruct` requests carry the detected fingerprints (`diagnosis_fingerprints`)
+and a short idiom note per fingerprint (`idiom_notes`) so the model receives
+grounded hints. Fingerprints only suggest; the linked REL SHA and objdiff remain
+the sole acceptance gate.
+
 ## Reading output
 
 - `EXACT`: the compared normalized function or configured object matches at

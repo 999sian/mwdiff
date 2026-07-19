@@ -21,6 +21,7 @@ Usage:
   mwdiff.py search --unit <unit> --fn <mangled_fn> --line <range> --families <list>
   mwdiff.py prove <target.o> <mine.o> <mangled_fn>
   mwdiff.py reconstruct --unit <unit> --ghidra-mcp-url <url> --llm-cmd <cmd>
+  mwdiff.py bench [--cases <cases.json>]
 
 `dtk` is found via $DTK or ./build/tools/dtk. `prove` and `search --prove`
 require `z3-solver`; other commands do not. Exit status: 0 = exact/equivalent,
@@ -88,6 +89,15 @@ class Diagnosis:
     register_map: dict[str, str]
     relocation_aliases: tuple[tuple[str, str], ...]
     suggested_families: tuple[str, ...]
+    fingerprints: tuple["Fingerprint", ...] = ()
+
+
+@dataclass(frozen=True)
+class Fingerprint:
+    name: str
+    cause: str
+    families: tuple[str, ...]
+    detail: str
 
 
 def parse_instruction(line):
@@ -143,8 +153,77 @@ def _relocation_aliases(target, candidate):
     return tuple(aliases)
 
 
-def _families_for(classification):
-    return {
+_SAVED_REGISTER = re.compile(r"\br(1[4-9]|2\d|3[01])\b")
+
+
+def _opcode_count(instrs, opcode):
+    return sum(1 for i in instrs if i.opcode == opcode)
+
+
+def detect_fingerprints(left_i, right_i, mapping):
+    found = []
+
+    def add(name, cause, families, detail):
+        found.append(Fingerprint(name, cause, tuple(families), detail))
+
+    for op, name, cause, families in (
+        ("extsb", "spurious-extsb", "u8 vs char/s8 field", ("width",)),
+        ("extsh", "spurious-extsb", "u16 vs s16 field", ("width",)),
+        ("frsp", "spurious-frsp", "f32 vs double arithmetic", ("fp-helper",)),
+        ("fctiwz", "float-to-int-dance", "float->int cast form", ("fp-helper",)),
+    ):
+        delta = _opcode_count(right_i, op) - _opcode_count(left_i, op)
+        if delta:
+            side = "mine" if delta > 0 else "target"
+            add(name, cause, families, f"{op} only in {side}")
+
+    if _opcode_count(left_i, "rlwimi") != _opcode_count(right_i, "rlwimi"):
+        add("bitfield-write", "bitfield member vs manual mask/shift",
+            ("bitfield",), "rlwimi count differs")
+
+    fmadds = {"fmadds", "fmsubs", "fnmadds", "fnmsubs"}
+    if (sum(_opcode_count(left_i, o) for o in fmadds)
+            != sum(_opcode_count(right_i, o) for o in fmadds)):
+        add("fp-contract", "fp_contract fusion on/off",
+            ("pragma", "fp-helper"), "fmadds fusion differs")
+
+    carry = {"addc", "adde", "subfc", "subfe"}
+    if (sum(_opcode_count(left_i, o) for o in carry)
+            != sum(_opcode_count(right_i, o) for o in carry)):
+        add("int64-carry", "64-bit arithmetic or downcast",
+            ("int64",), "carry-chain opcodes differ")
+
+    permuted = {src: dst for src, dst in mapping.items() if src != dst}
+    if permuted and all(
+            _SAVED_REGISTER.fullmatch(src) and _SAVED_REGISTER.fullmatch(dst)
+            for src, dst in permuted.items()):
+        add("saved-register-order", "local declaration order colors saved regs",
+            ("decl-order", "param-inversion"),
+            "register permutation within r14-r31")
+
+    return tuple(found)
+
+
+IDIOM_CATALOG = {
+    "spurious-extsb": "The target integer field is unsigned; a signed spelling "
+        "(char/s8 for a byte, s16 for a halfword) adds the extsb/extsh. Use the "
+        "unsigned type (u8, or u16), not char/s16.",
+    "spurious-frsp": "The target arithmetic is f32; a double expression adds "
+        "the frsp. Keep the expression in f32 (avoid a double intermediate).",
+    "float-to-int-dance": "Match the exact (int)/(s32) cast form of the float.",
+    "bitfield-write": "The target writes a bitfield member; express it as the "
+        "member, not a manual (x & ~M) | (v << S).",
+    "fp-contract": "The target fuses a*b+c into fmadds; keep the multiply-add "
+        "in one expression (or split it to unfuse).",
+    "int64-carry": "The target uses 64-bit arithmetic; use long long, and place "
+        "the downcast where the target prunes the carry chain.",
+    "saved-register-order": "Saved-register assignment follows local declaration "
+        "order; reorder the local declarations to recolor the saved registers.",
+}
+
+
+def _families_for(classification, fingerprints=()):
+    structural = {
         "global-register-permutation": ("bool", "compare", "local-form"),
         "local-register-allocation": ("cast", "load", "local-form"),
         "scheduling": ("load", "local-form", "evaluation-order"),
@@ -157,6 +236,12 @@ def _families_for(classification):
         "semantic-instruction": (),
         "exact": (),
     }[classification]
+    ordered = []
+    for family in [f for fp in fingerprints for f in fp.families] + list(structural):
+        if family not in ordered:
+            ordered.append(family)
+    last = [f for f in ordered if f in {"pragma", "param-inversion"}]
+    return tuple([f for f in ordered if f not in last] + last)
 
 
 def diagnose_lines(target, candidate):
@@ -165,6 +250,7 @@ def diagnose_lines(target, candidate):
     neutral_left = [_relocation_neutral(line) for line in left]
     neutral_right = [_relocation_neutral(line) for line in right]
     mapping = {}
+    fingerprints = ()
     if left == right:
         classification = "exact"
     elif neutral_left == neutral_right:
@@ -188,8 +274,42 @@ def diagnose_lines(target, candidate):
             classification = "branch-shape"
         else:
             classification = "semantic-instruction"
+        fingerprints = detect_fingerprints(left_i, right_i, mapping)
     return Diagnosis(classification, len(fn_diff(target, candidate)), mapping, aliases,
-                     _families_for(classification))
+                     _families_for(classification, fingerprints), fingerprints)
+
+
+def run_bench(cases):
+    fingerprint_hits = family_hits = 0
+    rows = []
+    for case in cases:
+        diagnosis = diagnose_lines(case["target"], case["mine"])
+        names = {fp.name for fp in diagnosis.fingerprints}
+        fp_ok = case["expect_fingerprint"] in names
+        fam_ok = case["expect_family"] in diagnosis.suggested_families
+        fingerprint_hits += fp_ok
+        family_hits += fam_ok
+        rows.append({"name": case["name"], "fingerprint": fp_ok,
+                     "family": fam_ok, "detected": sorted(names)})
+    total = len(cases)
+    return {"total": total, "fingerprint_hits": fingerprint_hits,
+            "family_hits": family_hits, "rows": rows}
+
+
+def cmd_bench(args):
+    path = Path(args.cases) if args.cases else (
+        Path(__file__).resolve().parent / "mwdiff_bench" / "cases.json")
+    cases = strict_json_loads(path.read_text())
+    report = run_bench(cases)
+    if args.json:
+        print(json.dumps(report, sort_keys=True))
+    else:
+        for row in report["rows"]:
+            mark = "ok" if row["fingerprint"] and row["family"] else "MISS"
+            print(f"[{mark}] {row['name']}: {', '.join(row['detected']) or '-'}")
+        print(f"fingerprints {report['fingerprint_hits']}/{report['total']}, "
+              f"families {report['family_hits']}/{report['total']}")
+    return 0 if report["fingerprint_hits"] == report["total"] else 1
 
 
 def die(msg, code=2):
@@ -1556,6 +1676,122 @@ def _mutate_version(snippet):
     return variants
 
 
+_WIDTH_GROUPS = (("s8", "u8", "char"), ("s16", "u16"), ("s32", "u32"))
+
+
+def _mutate_width(snippet):
+    variants = {}
+    for group in _WIDTH_GROUPS:
+        for source in group:
+            for dest in group:
+                if source == dest:
+                    continue
+                # casts: (source) -> (dest)
+                if f"({source})" in snippet:
+                    variants[f"width:{source}-to-{dest}-cast"] = (
+                        snippet.replace(f"({source})", f"({dest})"))
+                # declarations: "<source> name" -> "<dest> name"
+                decl = re.compile(rf"(?m)^(\s*){source}(\s+[A-Za-z_]\w*\s*=)")
+                if decl.search(snippet):
+                    variants[f"width:{source}-to-{dest}-decl"] = decl.sub(
+                        rf"\g<1>{dest}\g<2>", snippet)
+    return variants
+
+
+def _mutate_fp_helper(snippet):
+    match = re.search(r"(?P<prefix>=\s*)(?P<expr>[^;]+)(?P<suffix>;)", snippet)
+    if not match:
+        return {}
+    expr = match.group("expr").strip()
+    variants = {
+        "fp-helper:f32": snippet[:match.start("expr")] + f"(f32)({expr})"
+                         + snippet[match.end("expr"):],
+        "fp-helper:f64": snippet[:match.start("expr")] + f"(f64)({expr})"
+                         + snippet[match.end("expr"):],
+    }
+    return variants
+
+
+def _mutate_bitfield(snippet):
+    variants = {}
+    read = re.search(
+        r"\((?P<base>[^()]+?)\s*>>\s*(?P<shift>\d+)\)\s*&\s*(?P<mask>0x[0-9A-Fa-f]+|\d+)",
+        snippet)
+    if read:
+        shift = int(read.group("shift"))
+        mask = int(read.group("mask"), 0)
+        shifted = mask << shift
+        rewrite = (f"({read.group('base')} & {shifted:#x}) >> {shift}")
+        variants["bitfield:extract-alt"] = (
+            snippet[:read.start()] + rewrite + snippet[read.end():])
+    return variants
+
+
+def _mutate_decl_order(snippet):
+    lines = snippet.splitlines(keepends=True)
+    decl = re.compile(r"^\s*[A-Za-z_]\w*(?:\s*\*)?\s+[A-Za-z_]\w*\s*(?:=[^;]*)?;\s*$")
+    block = []
+    for index, line in enumerate(lines):
+        if decl.match(line):
+            block.append(index)
+        elif block:
+            break
+    variants = {}
+    if 2 <= len(block) <= 4:
+        indices = block
+        for perm_i, order in enumerate(itertools.permutations(indices)):
+            if list(order) == indices:
+                continue
+            new_lines = list(lines)
+            for slot, source in zip(indices, order):
+                new_lines[slot] = lines[source]
+            variants[f"decl-order:{perm_i}"] = "".join(new_lines)
+    return variants
+
+
+def _mutate_param_inversion(snippet):
+    match = re.search(
+        r"(?m)^(?P<indent>\s*)(?P<call>[A-Za-z_]\w*)\((?P<a>[^,]+?),\s*"
+        r"(?P<b>[^,]+)\);\s*$", snippet)
+    if not match:
+        return {}
+    indent = match.group("indent")
+    a, b = match.group("a").strip(), match.group("b").strip()
+    hoist_a = (f"{indent}auto _p0 = {a};\n"
+               f"{indent}{match.group('call')}(_p0, {b});")
+    return {"param-inversion:hoist-first":
+            snippet[:match.start()] + hoist_a + snippet[match.end():]}
+
+
+_PRAGMAS = (
+    ("peephole off", "peephole on"),
+    ("scheduling off", "scheduling on"),
+    ("fp_contract on", "fp_contract off"),
+)
+
+
+def _mutate_pragma(snippet):
+    variants = {}
+    body = snippet if snippet.endswith("\n") else snippet + "\n"
+    for enter, leave in _PRAGMAS:
+        key = enter.replace(" ", "-")
+        variants[f"pragma:{key}"] = (
+            f"#pragma {enter}\n{body}#pragma {leave}\n")
+    return variants
+
+
+def _mutate_int64(snippet):
+    match = re.search(
+        r"\((?P<cast>s32|u32|s16|u16)\)\((?P<inner>[^()]+?)\s*>>\s*(?P<shift>\w+)\)",
+        snippet)
+    if not match:
+        return {}
+    rewrite = (f"({match.group('cast')}){match.group('inner')}"
+               f" >> {match.group('shift')}")
+    return {"int64:early-downcast":
+            snippet[:match.start()] + rewrite + snippet[match.end():]}
+
+
 MUTATION_FAMILIES = {
     "bool": _mutate_bool,
     "compare": _mutate_compare,
@@ -1568,6 +1804,13 @@ MUTATION_FAMILIES = {
     "return": _mutate_return,
     "evaluation-order": _mutate_reassociate,
     "version": _mutate_version,
+    "width": _mutate_width,
+    "fp-helper": _mutate_fp_helper,
+    "bitfield": _mutate_bitfield,
+    "decl-order": _mutate_decl_order,
+    "param-inversion": _mutate_param_inversion,
+    "pragma": _mutate_pragma,
+    "int64": _mutate_int64,
 }
 
 
@@ -3060,6 +3303,16 @@ def build_reconstruction_request(
         section for section in snapshot.sections
         if float(section.get("match_percent") or 0.0) != 100.0
     ]
+    if focus.kind == "function":
+        target_lines = norm(resolve_fn(
+            disasm(str(unit.target), unit.project, runner=runner),
+            focus.name, str(unit.target)))
+        mine_lines = norm(resolve_fn(
+            disasm(str(unit.mine), unit.project, runner=runner),
+            focus.name, str(unit.mine)))
+        fingerprints = diagnose_lines(target_lines, mine_lines).fingerprints
+    else:
+        target_lines, mine_lines, fingerprints = [], [], ()
     return {
         "schema": schema,
         "phase": {
@@ -3094,18 +3347,13 @@ def build_reconstruction_request(
                 }
                 if focus.kind != "function" else None
             ),
-            "target_disassembly": (
-                norm(resolve_fn(
-                    disasm(str(unit.target), unit.project, runner=runner),
-                    focus.name, str(unit.target)))
-                if focus.kind == "function" else []
-            ),
-            "mine_disassembly": (
-                norm(resolve_fn(
-                    disasm(str(unit.mine), unit.project, runner=runner),
-                    focus.name, str(unit.mine)))
-                if focus.kind == "function" else []
-            ),
+            "target_disassembly": target_lines,
+            "mine_disassembly": mine_lines,
+            "diagnosis_fingerprints": [
+                dataclasses.asdict(fp) for fp in fingerprints],
+            "idiom_notes": {
+                fp.name: IDIOM_CATALOG[fp.name]
+                for fp in fingerprints if fp.name in IDIOM_CATALOG},
         },
         "ghidra": ghidra_evidence,
         "feedback": feedback,
@@ -4432,6 +4680,10 @@ def cmd_diagnose(args):
     else:
         print(f"{args.fn}: {diagnosis.diff_lines} changed lines")
         print(f"  classification: {diagnosis.classification}")
+        if diagnosis.fingerprints:
+            print("  fingerprints:")
+            for fp in diagnosis.fingerprints:
+                print(f"    - {fp.name}: {fp.cause} ({fp.detail})")
         if diagnosis.register_map:
             changed = [
                 f"{a} -> {b}"
@@ -4701,6 +4953,11 @@ def main():
     r.add_argument("--proof-timeout-ms", type=int, default=5000)
     r.add_argument("--json", action="store_true")
     r.set_defaults(run=cmd_reconstruct)
+
+    b = sub.add_parser("bench", help="score idiom fingerprint/family detection")
+    b.add_argument("--cases")
+    b.add_argument("--json", action="store_true")
+    b.set_defaults(run=cmd_bench)
 
     args = p.parse_args()
     sys.exit(args.run(args))

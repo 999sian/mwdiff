@@ -2303,6 +2303,75 @@ class TestReconstructionEngine(unittest.TestCase):
             self.assertEqual(propose["schema"], "mwdiff.reconstruct.propose.v1")
             self.assertEqual(propose["phase"], "propose")
 
+    def test_request_carries_idiom_fingerprints(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory).resolve()
+            (project / "src").mkdir()
+            source = project / "src/demo.cpp"
+            source.write_bytes(b"source\n")
+            unit = types.SimpleNamespace(
+                name="demo/demo", version="GZLP01", project=project,
+                source=source, target=project / "t.o", mine=project / "m.o",
+                compiler="mwcc_233_163", compiler_flags="-O4,p",
+                context_path=None,
+            )
+            focus = ReconstructionFocus("function", "fn", 50.0)
+            snapshot = UnitSnapshot(
+                50.0, 50.0, 100.0,
+                ({"name": "fn", "kind": "SYMBOL_FUNCTION",
+                  "match_percent": 50.0},),
+                (), ({"name": ".text", "kind": "SECTION_CODE",
+                      "match_percent": 50.0},),
+            )
+            score = ReconstructionScore(
+                None, False, 50.0, 50.0, 100.0, 50.0,
+                "scheduling", 0, 0, 0, 3,
+            )
+            disasm_by_object = {
+                str(unit.target): {"fn": ["fadds f1, f1, f2\n"]},
+                str(unit.mine): {"fn": ["fadds f1, f1, f2\n", "frsp f1, f1\n"]},
+            }
+            with mock.patch("mwdiff.disasm",
+                            side_effect=lambda obj, *a, **k: disasm_by_object[obj]):
+                request = build_reconstruction_request(
+                    "mwdiff.reconstruct.analyze.v1", {"id": 1}, "state-id",
+                    unit, focus, snapshot, score, {source}, "cmd",
+                    {"decompiler": "x"}, [], 1, 7, 100,
+                )
+            self.assertIn(
+                "frsp f1, f1", "\n".join(request["objdiff"]["mine_disassembly"]))
+            self.assertIn(
+                "spurious-frsp",
+                {fp["name"] for fp in request["objdiff"]["diagnosis_fingerprints"]})
+            self.assertIn("spurious-frsp", request["objdiff"]["idiom_notes"])
+            self.assertIn("f32", request["objdiff"]["idiom_notes"]["spurious-frsp"])
+
+    def test_request_omits_fingerprints_for_unit_focus(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory).resolve()
+            (project / "src").mkdir()
+            source = project / "src/demo.cpp"
+            source.write_bytes(b"source\n")
+            unit = types.SimpleNamespace(
+                name="demo/demo", version="GZLP01", project=project,
+                source=source, target=project / "t.o", mine=project / "m.o",
+                compiler="mwcc_233_163", compiler_flags="-O4,p",
+                context_path=None,
+            )
+            focus = ReconstructionFocus("unit-code", None, 50.0)
+            snapshot = UnitSnapshot(50.0, 50.0, 100.0, (), (), ())
+            score = ReconstructionScore(
+                None, False, 50.0, 50.0, 100.0, 50.0,
+                "scheduling", 0, 0, 0, 3,
+            )
+            request = build_reconstruction_request(
+                "mwdiff.reconstruct.analyze.v1", {"id": 1}, "state-id",
+                unit, focus, snapshot, score, {source}, "cmd",
+                {"decompiler": "x"}, [], 1, 7, 100,
+            )
+            self.assertEqual(request["objdiff"]["diagnosis_fingerprints"], [])
+            self.assertEqual(request["objdiff"]["idiom_notes"], {})
+
     def test_one_round_reaches_exact_and_restores_without_apply(self):
         with ExitStack() as stack:
             env = _engine_project(stack)

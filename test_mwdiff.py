@@ -14,9 +14,10 @@ from unittest import mock
 
 from mwdiff import (SourceTransaction, cmd_diagnose, cmd_prove, cmd_search,
                     cmd_try, fn_diff, main, norm, prove_objects, replace_unique)
-from mwdiff import diagnose_lines, infer_register_map, parse_instruction
-from mwdiff import generate_candidates, source_range
+from mwdiff import diagnose_lines, infer_register_map, parse_instruction, Fingerprint
+from mwdiff import generate_candidates, source_range, MUTATION_FAMILIES
 from mwdiff import resolve_unit
+from mwdiff import run_bench
 from mwdiff import SourceCandidate
 from mwdiff import (CandidateCache, ObjectScore, SearchResult, VerificationResult,
                     available_versions, cache_material, configured_versions,
@@ -617,6 +618,53 @@ class TestDiagnosis(unittest.TestCase):
         payload = json.loads(output.getvalue())
         self.assertEqual(payload["classification"], "exact")
         self.assertEqual(payload["diff_lines"], 0)
+
+
+class TestFingerprints(unittest.TestCase):
+    def test_spurious_extsb_detected(self):
+        target = ["lbz r0, 0x20a(r31)", "stb r0, 0x8(r3)"]
+        mine = ["lbz r0, 0x20a(r31)", "extsb r0, r0", "stb r0, 0x8(r3)"]
+        d = diagnose_lines(target, mine)
+        names = {fp.name for fp in d.fingerprints}
+        self.assertIn("spurious-extsb", names)
+        self.assertIn("width", d.suggested_families)
+
+    def test_spurious_frsp_detected(self):
+        target = ["fmuls f1, f1, f2", "stfs f1, 0x4(r3)"]
+        mine = ["fmul f1, f1, f2", "frsp f1, f1", "stfs f1, 0x4(r3)"]
+        d = diagnose_lines(target, mine)
+        self.assertIn("spurious-frsp", {fp.name for fp in d.fingerprints})
+        self.assertIn("fp-helper", d.suggested_families)
+
+    def test_saved_register_order_detected(self):
+        target = ["mr r30, r3", "mr r31, r4"]
+        mine = ["mr r31, r3", "mr r30, r4"]
+        d = diagnose_lines(target, mine)
+        self.assertIn("saved-register-order", {fp.name for fp in d.fingerprints})
+        self.assertIn("decl-order", d.suggested_families)
+
+    def test_clean_diff_has_no_fingerprints(self):
+        # exact path: fingerprints default to ()
+        same = ["addi r3, r3, 1", "blr"]
+        self.assertEqual(diagnose_lines(same, same).fingerprints, ())
+        # real non-exact diff with no tell opcodes: the detector stays silent
+        target = ["add r0, r3, r4", "lwz r5, 0x0(r6)"]
+        mine = ["lwz r5, 0x0(r6)", "add r0, r3, r4"]
+        d = diagnose_lines(target, mine)
+        self.assertNotEqual(d.classification, "exact")
+        self.assertEqual(d.fingerprints, ())
+
+    def test_bitfield_rlwimi_detected(self):
+        target = ["rlwimi r0, r4, 4, 24, 27", "stw r0, 0x0(r3)"]
+        mine = ["slwi r4, r4, 4", "or r0, r0, r4", "stw r0, 0x0(r3)"]
+        self.assertIn("bitfield-write",
+                      {fp.name for fp in diagnose_lines(target, mine).fingerprints})
+
+    def test_int64_carry_detected(self):
+        target = ["addc r4, r4, r6", "adde r3, r3, r5"]
+        mine = ["add r4, r4, r6", "add r3, r3, r5"]
+        self.assertIn("int64-carry",
+                      {fp.name for fp in diagnose_lines(target, mine).fingerprints})
 
 
 
@@ -1605,6 +1653,78 @@ class TestVerification(unittest.TestCase):
             self.assertIn("restore boom", message)
             self.assertIsInstance(caught.exception.__cause__, RuntimeError)
             self.assertEqual(str(caught.exception.__cause__), "verify boom")
+
+class TestIdiomFamilies(unittest.TestCase):
+    def _apply(self, family, snippet):
+        return MUTATION_FAMILIES[family](snippet)
+
+    def test_width_swaps_same_width_sign_only(self):
+        out = self._apply("width", "    u8 v = obj->flag;\n")
+        texts = set(out.values())
+        self.assertIn("    s8 v = obj->flag;\n", texts)
+        self.assertIn("    char v = obj->flag;\n", texts)
+        # never a cross-width or int<->s32 swap
+        self.assertFalse(any("s16" in t or "s32" in t or "int " in t for t in texts))
+
+    def test_width_swaps_casts_too(self):
+        out = self._apply("width", "    x = (s16)obj->raw;\n")
+        self.assertIn("    x = (u16)obj->raw;\n", set(out.values()))
+
+    def test_fp_helper_wraps(self):
+        out = self._apply("fp-helper", "    f32 r = a * b + c;\n")
+        texts = set(out.values())
+        self.assertTrue(any("(f32)(a * b + c)" in t for t in texts))
+        self.assertTrue(any("(f64)(a * b + c)" in t for t in texts))
+
+    def test_bitfield_rewrites_extract(self):
+        out = self._apply("bitfield", "    x = (obj->bits >> 4) & 0x7;\n")
+        self.assertIn(
+            "    x = (obj->bits & 0x70) >> 4;\n", set(out.values()))
+
+    def test_decl_order_permutes_adjacent_decls(self):
+        snippet = "    s16 a = f();\n    s16 b = g();\n"
+        out = self._apply("decl-order", snippet)
+        self.assertIn("    s16 b = g();\n    s16 a = f();\n", set(out.values()))
+
+    def test_param_inversion_hoists_argument(self):
+        out = self._apply("param-inversion", "    draw(getX(o), getY(o));\n")
+        self.assertTrue(any("= getX(o);" in t for t in out.values()))
+
+    def test_pragma_wraps_snippet(self):
+        out = self._apply("pragma", "    total += step;\n")
+        texts = set(out.values())
+        self.assertTrue(any("#pragma peephole off" in t for t in texts))
+        self.assertTrue(any("#pragma scheduling off" in t for t in texts))
+        self.assertTrue(any("#pragma fp_contract on" in t for t in texts))
+
+    def test_int64_moves_downcast(self):
+        out = self._apply("int64", "    x = (s32)(hi_lo >> shift);\n")
+        self.assertTrue(any("(s32)hi_lo >> shift" in t for t in out.values()))
+
+    def test_anchored_families_return_empty_without_anchor(self):
+        for family in ("width", "fp-helper", "bitfield", "decl-order",
+                       "param-inversion", "int64"):
+            self.assertEqual(self._apply(family, "return;\n"), {})
+        # pragma has no anchor: it always wraps any snippet.
+        self.assertTrue(self._apply("pragma", "return;\n"))
+
+    def test_generate_candidates_accepts_new_families(self):
+        candidates = generate_candidates(
+            "    u8 v = obj->flag;\n", ["width"], depth=1)
+        self.assertTrue(candidates)
+
+class TestBench(unittest.TestCase):
+    def test_bench_scores_seeded_cases(self):
+        cases = [
+            {"name": "u8", "target": ["lbz r0, 0x8(r3)"],
+             "mine": ["lbz r0, 0x8(r3)", "extsb r0, r0"],
+             "expect_fingerprint": "spurious-extsb", "expect_family": "width"},
+        ]
+        report = run_bench(cases)
+        self.assertEqual(report["fingerprint_hits"], 1)
+        self.assertEqual(report["family_hits"], 1)
+        self.assertEqual(report["total"], 1)
+
 
 
 if __name__ == '__main__':
