@@ -230,6 +230,90 @@ class TestSourceTransaction(unittest.TestCase):
             for signum, handler in previous.items():
                 self.assertIs(signal.getsignal(signum), handler)
 
+    def test_retained_edit_is_rolled_back_on_exception(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "source.cpp"
+            path.write_text("before\n")
+            with self.assertRaisesRegex(RuntimeError, "stop"):
+                with SourceTransaction(path) as source:
+                    source.write_text("after\n")
+                    source.retain()
+                    raise RuntimeError("stop")
+            self.assertEqual(path.read_text(), "before\n")
+
+    def test_retained_edit_is_rolled_back_on_deferred_signal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "source.cpp"
+            path.write_text("before\n")
+            previous = signal.getsignal(signal.SIGTERM)
+            with self.assertRaisesRegex(KeyboardInterrupt, "SIGTERM"):
+                with SourceTransaction(path) as source:
+                    source.write_text("after\n")
+                    source.retain()
+                    source.handle_signal(signal.SIGTERM, None)
+            self.assertEqual(path.read_text(), "before\n")
+            self.assertIs(signal.getsignal(signal.SIGTERM), previous)
+
+    def test_retained_edit_is_rolled_back_when_handler_restore_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "source.cpp"
+            path.write_text("before\n")
+            previous = {
+                signum: signal.getsignal(signum)
+                for signum in (signal.SIGINT, signal.SIGTERM)
+            }
+            real_signal = signal.signal
+            calls = []
+
+            def flaky(signum, handler):
+                calls.append(signum)
+                if len(calls) > 2:
+                    raise RuntimeError("handler restore failed")
+                return real_signal(signum, handler)
+
+            try:
+                with mock.patch("signal.signal", flaky), \
+                        self.assertRaisesRegex(RuntimeError, "handler restore failed"):
+                    with SourceTransaction(path) as source:
+                        source.write_text("after\n")
+                        source.retain()
+                self.assertEqual(path.read_text(), "before\n")
+            finally:
+                for signum, handler in previous.items():
+                    real_signal(signum, handler)
+
+    def test_raise_pending_clears_and_raises_recorded_signal(self):
+        transaction = SourceTransaction("unused.cpp")
+        self.assertIsNone(transaction.raise_pending())
+        transaction.pending_signal = signal.SIGTERM
+        with self.assertRaisesRegex(KeyboardInterrupt, "SIGTERM"):
+            transaction.raise_pending()
+        self.assertIsNone(transaction.pending_signal)
+        self.assertIsNone(transaction.raise_pending())
+
+    def test_rollback_attempts_every_path_before_first_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "first.cpp"
+            second = root / "second.cpp"
+            first.write_text("first\n")
+            second.write_text("second\n")
+            real_write = Path.write_bytes
+
+            def fail_first(self_path, data):
+                if self_path == first:
+                    raise OSError("cannot restore first")
+                return real_write(self_path, data)
+
+            with mock.patch.object(Path, "write_bytes", fail_first):
+                with self.assertRaisesRegex(OSError, "cannot restore first"):
+                    with SourceTransaction([first, second]) as source:
+                        source.write_files({first: "x\n", second: "y\n"})
+                        raise RuntimeError("stop")
+            # first failed to restore; second was still attempted and restored.
+            self.assertEqual(first.read_text(), "x\n")
+            self.assertEqual(second.read_text(), "second\n")
+
 
 class TestTry(unittest.TestCase):
     def make_args(self, directory, source_text, variants_text, show_best=False):
@@ -599,6 +683,20 @@ class TestProjectResolution(unittest.TestCase):
                 "target_path": "build/GZLP01/obj/d/main/d_a_demo.o",
                 "base_path": "build/GZLP01/src/d/main/d_a_demo.o",
                 "metadata": {"source_path": "src/d/main/d_a_demo.cpp"},
+            }]}))
+
+            unit = resolve_unit(root, "d_a_demo", "GZLP01")
+
+            self.assertIsNone(unit.module)
+
+    def test_short_target_path_has_no_rel_module(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "objdiff.json").write_text(json.dumps({"units": [{
+                "name": "d_a_demo",
+                "target_path": "build/GZLP01/d_a_demo.o",
+                "base_path": "build/GZLP01/d_a_demo.o",
+                "metadata": {"source_path": "src/d_a_demo.cpp"},
             }]}))
 
             unit = resolve_unit(root, "d_a_demo", "GZLP01")
@@ -1394,6 +1492,119 @@ class TestVerification(unittest.TestCase):
                     ),
                 ],
             )
+
+    def test_verify_version_routes_every_command_through_runner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "src/d/actor/demo.cpp"
+            source.parent.mkdir(parents=True)
+            source.write_text("")
+            rel = root / "build/GZLP01/demo/demo.rel"
+            rel.parent.mkdir(parents=True)
+            rel.write_bytes(b"linked rel")
+            report = {
+                "units": [
+                    {
+                        "name": "d/actor/demo",
+                        "measures": {
+                            "matched_functions_percent": 100.0,
+                            "matched_code_percent": 100.0,
+                            "matched_data_percent": 100.0,
+                        },
+                    }
+                ]
+            }
+            (root / "build/GZLP01/report.json").write_text(json.dumps(report))
+            sha_file = root / "config/GZLP01/build.sha1"
+            sha_file.parent.mkdir(parents=True)
+            sha_file.write_text(
+                hashlib.sha1(b"linked rel").hexdigest()
+                + "  build/GZLP01/demo/demo.rel\n"
+            )
+            unit = mock.Mock(source=source, module="demo")
+            calls = []
+
+            def runner(command, **kwargs):
+                calls.append(command)
+                return mock.Mock(returncode=0, stdout="", stderr="")
+
+            with mock.patch("mwdiff.subprocess.run") as forbidden, \
+                    mock.patch("mwdiff.resolve_unit", return_value=unit):
+                result = verify_version(
+                    root, "demo", "GZLP01", runner=runner
+                )
+
+            forbidden.assert_not_called()
+            self.assertEqual(len(calls), 3)
+            self.assertEqual(result.rel_sha_match, True)
+
+    def test_verify_all_records_two_versions_and_restores(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            configured_unit = mock.Mock(version="D44J01")
+            results = {
+                "GZLP01": VerificationResult("GZLP01", 100.0, 100.0, 100.0, True),
+                "D44J01": VerificationResult("D44J01", 90.0, 90.0, 90.0, False),
+            }
+            calls = []
+
+            def runner(command, **kwargs):
+                calls.append(command)
+                return mock.Mock(returncode=0, stdout="", stderr="")
+
+            def fake_verify(project, unit_name, version, *, runner=None):
+                runner(["verify", version])
+                return results[version]
+
+            with mock.patch("mwdiff.resolve_unit", return_value=configured_unit), \
+                    mock.patch(
+                        "mwdiff.available_versions",
+                        return_value=["GZLP01", "D44J01"],
+                    ), \
+                    mock.patch("mwdiff.verify_version", side_effect=fake_verify), \
+                    mock.patch("mwdiff.subprocess.run") as forbidden:
+                out = verify_all(
+                    root, "demo", ["GZLP01", "D44J01"], runner=runner
+                )
+
+            forbidden.assert_not_called()
+            self.assertEqual(out, [results["GZLP01"], results["D44J01"]])
+            self.assertEqual(calls[0], ["verify", "GZLP01"])
+            self.assertEqual(calls[1], ["verify", "D44J01"])
+            self.assertEqual(
+                calls[2],
+                [sys.executable, "configure.py", "--version", "D44J01"],
+            )
+            self.assertEqual(calls[3], ["ninja", "build.ninja"])
+
+    def test_verify_all_reports_both_verification_and_restore_failures(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            configured_unit = mock.Mock(version="D44J01")
+
+            def runner(command, **kwargs):
+                if command[:2] == [sys.executable, "configure.py"]:
+                    return mock.Mock(
+                        returncode=1, stdout="", stderr="restore boom"
+                    )
+                return mock.Mock(returncode=0, stdout="", stderr="")
+
+            def fake_verify(project, unit_name, version, *, runner=None):
+                raise RuntimeError("verify boom")
+
+            with mock.patch("mwdiff.resolve_unit", return_value=configured_unit), \
+                    mock.patch(
+                        "mwdiff.available_versions", return_value=["GZLP01"]
+                    ), \
+                    mock.patch("mwdiff.verify_version", side_effect=fake_verify):
+                with self.assertRaises(RuntimeError) as caught:
+                    verify_all(root, "demo", ["GZLP01"], runner=runner)
+
+            message = str(caught.exception)
+            self.assertIn("verify boom", message)
+            self.assertIn("restore boom", message)
+            self.assertIsInstance(caught.exception.__cause__, RuntimeError)
+            self.assertEqual(str(caught.exception.__cause__), "verify boom")
 
 
 if __name__ == '__main__':

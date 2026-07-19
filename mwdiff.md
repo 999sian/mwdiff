@@ -333,6 +333,249 @@ suppress.
 `search --prove` rejects only `different`. It retains and labels `unknown`
 candidates because unknown is not evidence of changed behavior.
 
+### `reconstruct` — autonomously reconstruct one configured unit
+
+`reconstruct` drives one configured `objdiff.json` unit toward an exact match
+in a bounded autonomous loop. Each round gathers Ghidra structural evidence,
+asks an external model for Ghidra metadata operations and then source edits,
+compiles every candidate with the real Ninja/MWCC target, scores complete
+objdiff measures, optionally proves supported non-exact integer candidates, and
+checks the configured per-unit linked artifact. It never stops for rename,
+type, or edit approval.
+
+```sh
+python3 "$MWDIFF" reconstruct \
+  --project . \
+  --version GZLP01 \
+  --unit d_a_example \
+  --ghidra-mcp-url http://127.0.0.1:8080/mcp \
+  --llm-cmd ./model-wrapper \
+  --max-rounds 8 \
+  --max-builds 100 \
+  --apply
+```
+
+#### Controls
+
+| Option | Behavior |
+|---|---|
+| `--project <path>` | Project root; default `.`. |
+| `--version <id>` | Select one configured unit version. |
+| `--unit <name-or-unique-suffix>` | Required. One unambiguous configured unit. |
+| `--ghidra-mcp-url <url>` | Required. Streamable HTTP Ghidra MCP endpoint. |
+| `--ghidra-program <project-path>` | Use a pre-imported disposable program instead of auto-import. |
+| `--ghidra-language <id>` | Override import processor/language detection. |
+| `--ghidra-compiler <id>` | Override import compiler-spec detection. |
+| `--llm-cmd <path>` | Required. Executable model wrapper; JSON in on stdin, JSON out on stdout. |
+| `--max-rounds <n>` | Analyze/propose cycles; default 8, must be positive. |
+| `--max-builds <n>` | Every attempted candidate build, including failures; default 100. |
+| `--mcp-timeout <s>` | Per MCP request; default 30 seconds. |
+| `--llm-timeout <s>` | Per model request; default 300 seconds. |
+| `--build-timeout <s>` | Per configure, Ninja, DTK, or objdiff process; default 600 seconds. |
+| `--edit-file <path>` | Repeatable. Extra existing header allowed for edits; the unit source is always editable. |
+| `--resume <state>` | Resume one saved state after validating every baseline hash. |
+| `--apply` | Retain the exact result; without it the exact patch is printed and source restored. |
+| `--verify-version <id>` | Repeatable. Additional locally available versions to verify before promotion. |
+| `--prove` | Enable the oracle for supported non-exact integer candidates. |
+| `--proof-timeout-ms <n>` | Per-proof Z3 timeout; default 5000. |
+| `--json` | Emit one machine-readable result document; diagnostics go to stderr. |
+
+#### Ghidra program: auto-import vs `--ghidra-program`
+
+Without `--ghidra-program`, the target object is imported into a generated
+disposable project folder keyed by unit name and target SHA. Auto-import
+requires the MCP server's host-file import permission. If the server does not
+grant it, pre-import a disposable target and pass its exact project path with
+`--ghidra-program`. Arbitrary already-open programs are never mutated;
+`--ghidra-program` must name a program dedicated to the run. `--ghidra-language`
+and `--ghidra-compiler` override detection only for legitimate processor/
+compiler variants; import still requires a 32-bit big-endian PowerPC language.
+
+#### Model protocol
+
+`--llm-cmd` is run with `shell=False` in its own process group and receives one
+JSON request on stdin per round. Each request carries a `schema` string, an
+explicit `phase`, immutable baseline hashes, remaining budgets, the current
+focus, allowed files/operations, gathered evidence, and previous-round
+feedback. Two request/response schemas are used, in order:
+
+Analyze (`"phase": "analyze"`, schema `mwdiff.reconstruct.analyze.v1`) requests
+an explanation and Ghidra metadata operations:
+
+```json
+{
+  "schema": "mwdiff.reconstruct.analyze.v1",
+  "summary": "evidence-backed explanation",
+  "ghidra_ops": [
+    {
+      "op": "set_prototype",
+      "function": "func_name_or_address",
+      "prototype": "int func_name(Type *self)",
+      "reason": "callers pass one object pointer"
+    }
+  ]
+}
+```
+
+Propose (`"phase": "propose"`, schema `mwdiff.reconstruct.propose.v1`) runs
+after confirmed Ghidra operations and requests source edits from the revised
+decompilation:
+
+```json
+{
+  "schema": "mwdiff.reconstruct.propose.v1",
+  "summary": "source-shape rationale",
+  "source_edits": [
+    {
+      "path": "src/d/actor/d_a_example.cpp",
+      "file_sha256": "current-file-sha256",
+      "old": "exact text occurring once",
+      "new": "replacement text"
+    }
+  ]
+}
+```
+
+Validators reject any other `phase` value or schema version. The response cap
+is 8 MiB; stdout and stderr are streamed and capped independently. Unknown
+top-level or operation fields, wrong scalar types, non-finite numbers, duplicate
+keys, invalid UTF-8, trailing output, or a nonzero exit are protocol errors. On
+timeout, output overflow, or cancellation the whole model process group is
+terminated.
+
+#### Ghidra operation rules
+
+Model output maps only to a fixed allowlist: rename a placeholder function,
+data symbol, parameter, or local; set a prototype; retype a parameter or local;
+create a structure in the disposable program; set or rename a structure field.
+Required fields per operation:
+
+| Operation | Required fields |
+|---|---|
+| `rename_function` | `function`, `new_name`, `reason` |
+| `rename_data` | `address_or_name`, `new_name`, `reason` |
+| `rename_variable` | `function`, `variable`, `new_name`, `reason` |
+| `set_prototype` | `function`, `prototype`, `reason` |
+| `retype_variable` | `function`, `variable`, `data_type`, `reason` |
+| `create_struct` | `c_definition`, `reason` |
+| `set_struct_field` | `structure_name`, `offset`, `data_type`, `field_name`, `reason` |
+| `rename_struct_field` | `structure_name`, `offset`, `new_name`, `reason` |
+
+Each operation needs a textual `reason`. Before mutation, a live query must
+resolve exactly one current entity. Renames are accepted only when the live
+name is a recognized decompiler placeholder (`FUN_*`, `DAT_*`, `param_*`,
+`local_*`); structure-field operations accept only an undefined gap or
+placeholder at the exact offset; `create_struct` requires an absent parsed name.
+Established symbols, types, and fields from the object, source, debug info, or
+prior analysis are never overwritten. After each mutation a second live query
+must observe the requested result on the same pre-read identity; a missing or
+ambiguous precondition and a well-formed tool rejection are per-operation
+failures, but a normal mutation response with an absent or wrong postcondition
+is a fatal protocol error (the disposable program may already be dirty). Only
+confirmed changes appear in revised evidence.
+
+#### Source-edit rules
+
+Source edits use exact single-occurrence replacement, not arbitrary patches.
+For each edit the path is normalized beneath the project root and must be the
+unit source or an explicit `--edit-file`, an existing regular UTF-8 file;
+`file_sha256` must equal the current accepted candidate's file hash; `old` must
+be nonempty and occur exactly once; overlapping edits to the same original range
+are rejected; and all edits in a set apply atomically or none. No source file
+is created, deleted, moved, or formatted.
+
+#### Focus and scoring
+
+The loop picks a focus from objdiff measures in this order:
+
+1. the lowest-matching function (ties broken by target order);
+2. `unit-code` when every named function is exact but aggregate code is not;
+3. `unit-data` when functions and code are exact but data is not;
+4. `unit-link` when object measures are exact but a linked hash fails.
+
+It stops incomplete if no editable target remains. Candidates are ordered by a
+deterministic unit score: applicable linked SHA exactness, whole-unit
+exactness, matched function/code/data percentages, focused-symbol match, focused
+mismatch classification, changed calls, changed memory operations, normalized
+diff lines, then stable proposal order. The focus component is recomputed from
+each candidate snapshot — a previous snapshot's focus percentage is never reused.
+For `unit-link`, exact object measures stay mandatory and relocation/symbol
+differences break ties before diff lines; a linked SHA mismatch never outranks a
+match. Only a strictly better score advances the single accepted path.
+
+#### Budgets and timeouts
+
+`--max-rounds` counts analyze/propose cycles; `--max-builds` counts every
+attempted candidate build, including compiler failures. Ghidra-only rounds with
+no source proposal consume a round but not a build. Round and build counters are
+checkpointed immediately after incrementing and before evidence, model, or build
+work, so a timeout, malformed response, cancellation, or compiler failure
+consumes the attempted budget across resume. `--mcp-timeout`, `--llm-timeout`,
+and `--build-timeout` bound each MCP request, model request, and local build
+process respectively; a `SIGINT`/`SIGTERM` sets deferred cancellation,
+terminates any active child process group, and raises at the next safe boundary
+with no later round or build starting.
+
+#### State and resume
+
+Incomplete runs write state and an append-only transcript under:
+
+```text
+.cache/mwdiff/reconstruct/<unit>-<state-hash>/
+```
+
+State records the schema version and options; project/unit/version/target and
+disposable-program identity; original editable-file hashes; compiler, flags,
+context, target-object, model-command, tool, MCP endpoint/server, MCP-schema,
+and link-manifest hashes; cumulative accepted source replacements; replayable
+successful Ghidra operations; and current score/focus/budgets/feedback.
+`--resume` rejects any changed identity or baseline before applying an edit; a
+fresh run refuses to overwrite an existing same-identity `state.json`. Resume
+replays cumulative edits in a new outer transaction and replays Ghidra
+operations when the disposable program is unavailable; consumed rounds and
+builds remain consumed. Source contents and model evidence may appear in the
+local transcript, so the state directory is `0700` and its files `0600` on
+POSIX; environment variables, authorization headers, credentials, and
+model-wrapper stderr are never persisted.
+
+#### Apply, rollback, and verification
+
+`--apply` retains source only when the rebuilt unit reports 100% functions,
+code, and data, every target function/matchable data section is present, and
+every applicable requested linked gate passes. Without `--apply` the exact
+patch is printed and source is restored. Every fatal path — protocol error,
+timeout, signal, stale/illegal edit, build/report/hash failure, or resume
+mismatch — restores caller source, generated context, and every generated
+artifact touched by the run. Candidate-level failures (compiler rejection,
+worse score, proof `different`, or a linked hash mismatch while budget remains)
+are feedback, not fatal.
+
+Link status is reported explicitly:
+
+| Status | Meaning |
+|---|---|
+| `not-applicable` | The unit exposes no per-unit linked checksum gate. |
+| `unavailable` | A requested version lacks real local disc input. |
+| `deferred` | A configured gate exists but object output is not yet exact. |
+| `match` | The rebuilt linked artifact's SHA equals the expected hash. |
+| `mismatch` | The linked SHA differs; promotion is withheld. |
+
+When no per-unit linked checksum exists, exact object output is the strongest
+available gate: the result states linked verification was unavailable and never
+claims the full executable matched. An incomplete run is labeled `incomplete`
+and is never called a recreation, match, proof, or success.
+
+#### Trust boundary
+
+The model wrapper and the configured MCP endpoint are trusted executables/
+services chosen by the operator. `mwdiff` validates their returned operations
+against the allowlists but cannot sandbox their own implementation or network
+access; the model response can neither run shell commands nor select MCP tools.
+The model process inherits the caller environment so its wrapper can obtain its
+own credentials, which `mwdiff` never reads, serializes, logs, or caches.
+Model-proposed names and types remain hypotheses: exact machine output proves
+code and data, not the human meaning of an inferred name.
+
 ## Reading output
 
 - `EXACT`: the compared normalized function or configured object matches at
