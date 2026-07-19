@@ -582,8 +582,10 @@ code and data, not the human meaning of an inferred name.
 python3 "$MWDIFF" bench [--cases PATH] [--json]
 ```
 
-Runs `diagnose` over transcribed `(target asm, mine asm, expected fingerprint,
-expected family)` cases (default `mwdiff_bench/cases.json`) and reports how often
+Runs `diagnose` over recorded `(target asm, mine asm, expected fingerprint,
+expected family)` cases (default `mwdiff_bench/cases.json`) — synthetic seeds plus
+real near-misses harvested from a second MWCC codebase (TP GZ2P01, GC/2.7) — and
+reports how often
 the expected fingerprint is detected and the expected family suggested. Fully
 offline: no build, network, or subprocess. Exit `0` iff every case's fingerprint
 is detected.
